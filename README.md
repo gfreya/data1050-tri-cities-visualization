@@ -14,13 +14,14 @@
 	- tensorflow
 	- pymongo
 	- plotly
+	- statsmodels
 
 - This is a web application to retrieve real-time time from web server and then join the two tables together. The newly merged dataframe will be uploaded to mongodb backend. Then we can load the new data from backend.
 
 - This web application has following functions: 
 	- demonstrate the time-series waveform of "voltage value", "load", "import" and "generation".
 	- demonstrate the  interactive plot for users to compare the utility in tri-cities and the recent project: Ashe main bus voltage.
-	- predict the future values according to past values of "voltage value", "load" and "import".
+	- predict the future values according to past day of voltage values, comparisons between baseline prediction model and improved prediction model.
 	- detect anomaly voltage values in a time period.
 	
 - Team Member: Yijing Gao and Qingyan Guo
