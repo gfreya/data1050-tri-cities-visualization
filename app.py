@@ -1,12 +1,13 @@
 import dash
 from dash import dcc
 from dash import html
+from dash.exceptions import PreventUpdate
 import numpy as np
 import plotly.graph_objects as go
-import tensorflow as tf
 from tensorflow import keras
 import pandas as pd
 from tensorflow.keras import layers
+from statsmodels.tsa.api import ExponentialSmoothing, SimpleExpSmoothing, Holt
 
 from database import fetch_all_voltage_as_df
 
@@ -109,13 +110,20 @@ def pred_description():
     Returns prediction description in markdown
     """
     return html.Div(children=[dcc.Markdown('''
-        # Voltage Predictions Based on the Present
+        # Voltage Predictions
         ''', className='description_header'),
-        html.Div('Observation is recorded every 5 mins, that means 12 times per hour. We will resample one \
-            point per hour by sampling_rate argument in timeseries_dataset_from_array \
-            utility, since no drastic change is expected within 60 minutes. We are tracking data from past \
-            (past: if past=240) timestamps (240/6=40 hours). This data will be used to predict the temperature \
-            after (future: if future=12) timestamps (12/6=2 hours).', className='description'),])
+        html.Div('In the prediction part, we use two methods to predict the \'voltage value\' from a \
+            specific day (which can be chosen by users). We create two prediction functions, the first \
+            is the Naïve approach and the second is an improved method. To visualize the comparisons between \
+            the prediction values and the real values, we use different colors to represent the different lines.', className='description'),
+        html.Div('If we want to forecast the voltage value for the next day, we can simply take the last day \
+            value and estimate the same value for the next day. Such forecasting technique which assumes that \
+            the next expected point is equal to the last observed point is called Naive Method.', className='description'),
+        html.Div('Hence we need a method that takes into account both trend and seasonality to forecast \
+            future voltage values. One such algorithm that we can use in such a scenario is Holt\'s Winter \
+            method. The idea behind triple exponential smoothing(Holt’s Winter) is to apply exponential smoothing \
+            to the seasonal components in addition to level and trend. So, we can see the predictions are more accurate \
+            than the baseline one.', className='description'),])
 
 
 def pred_tool():
@@ -127,18 +135,11 @@ def pred_tool():
         html.Div(children=[dcc.Graph(id='pred-figure')]),
 
         html.Div(children=[
-            html.H5("Prediction Parameter", style={'marginTop': '2rem'}),
-            html.Div(children=[
-                html.Div('Past Data:', className='description'),
-                dcc.Slider(id='past-slider', min=225, max=255, step=1, value=250,
-                           tooltip={"placement": "bottom", "always_visible": True},),
-            ], className='p_slider', style={'marginTop': '5rem'}),
-
             html.Div(children=[
                 html.Div('Future Data:', className='description'),
-                dcc.Slider(id='future-slider', min=7, max=12, step=1, value=7,
+                dcc.Slider(id='future-slider', min=4, max=6, step=1, value=5,
                            tooltip={"placement": "bottom", "always_visible": True},),
-            ], className='p_slider', style={'marginTop': '3rem'}),
+            ], className='p_slider', style={'marginTop': '5rem'}),
         ], className='columns', style={'marginLeft': 5, 'marginTop': '10%'}),
     ])
 
@@ -147,7 +148,7 @@ def ad_description():
     Returns anormaly detection description in markdown
     """
     return html.Div(children=[dcc.Markdown('''
-        # Anormaly Detection
+        # Anomaly Detection
         ''', className='description_header'),
         html.Div('The anomaly detection tool demonstrates how you can use a reconstruction \
                  convolutional autoencoder model to detect anomalies in timeseries data. We have a \
@@ -258,125 +259,61 @@ def slider_plot(index):
 
 @app.callback(
     dash.dependencies.Output('pred-figure', 'figure'),
-    [dash.dependencies.Input('past-slider', 'value'),
-     dash.dependencies.Input('future-slider', 'value')])
+    dash.dependencies.Input('future-slider', 'value'))
 
-def pred(past, future):
-    '''
-    prediction function
-    '''
+def base_imp(day):
+    # day should be 4,5,6
     df = fetch_all_voltage_as_df(allow_cached=True)
-    split_fraction = 0.715
-    train_split = int(split_fraction * int(df.shape[0]))
-    step = 4
+    df_pred = df[["Datetime","vol_value"]]
+    train=df_pred[0:day*288] 
+    test=df_pred[day*288:]
 
-    past = int(past)
-    future = int(future)
-    learning_rate = 0.001
-    batch_size = 64
-    epochs = 10
+    #Aggregating the dataset at daily level
+    df_pred.Timestamp = pd.to_datetime(df_pred.Datetime,format='%d-%m-%Y %H:%M') 
+    df_pred.index = df_pred.Timestamp 
+    df_pred = df_pred.resample('H').mean()
+    train.Timestamp = pd.to_datetime(train.Datetime,format='%d-%m-%Y %H:%M') 
+    train.index = train.Timestamp 
+    train = train.resample('H').mean() 
+    test.Timestamp = pd.to_datetime(test.Datetime,format='%d-%m-%Y %H:%M') 
+    test.index = test.Timestamp 
+    test = test.resample('H').mean()
+    
+    dd= np.asarray(train.vol_value)
+    y_hat = test.copy()
+    y_hat['naive'] = dd[len(dd)-1]
+    
+    y_hat_avg = test.copy()
+    fit1 = ExponentialSmoothing(np.asarray(train['vol_value']) ,seasonal_periods=7 ,trend='add', seasonal='add',).fit()
+    y_hat_avg['Holt_Winter'] = fit1.forecast(len(test))
 
-    feature_keys = [
-        "vol_value",
-        "Import",
-        "Load",
-        "Generation",
-    ]
-    date_time_key = "Datetime"
-
-
-    def normalize(data, train_split):
-        data_mean = data[:train_split].mean(axis=0)
-        data_std = data[:train_split].std(axis=0)
-        return (data - data_mean) / data_std
-
-    selected_features = [feature_keys[i] for i in [0, 1, 2]]
-    features = df[selected_features]
-    features.index = df[date_time_key]
-    features.head()
-
-    features = normalize(features.values, train_split)
-    features = pd.DataFrame(features)
-    features.head()
-
-    train_data = features.loc[0 : train_split - 1]
-    val_data = features.loc[train_split:]
-
-    start = past + future
-    end = start + train_split
-
-    x_train = train_data[[i for i in range(3)]].values
-    y_train = features.iloc[start:end][[1]]
-
-    sequence_length = int(past / step)
-
-    dataset_train = keras.preprocessing.timeseries_dataset_from_array(
-        x_train,
-        y_train,
-        sequence_length=sequence_length,
-        sampling_rate=step,
-        batch_size=batch_size,
-    )
-
-    x_end = len(val_data) - past - future
-
-    label_start = train_split + past + future
-
-    x_val = val_data.iloc[:x_end][[i for i in range(3)]].values
-    y_val = features.iloc[label_start:][[1]]
-
-    dataset_val = keras.preprocessing.timeseries_dataset_from_array(
-        x_val,
-        y_val,
-        sequence_length=sequence_length,
-        sampling_rate=step,
-        batch_size=batch_size,
-    )
-
-
-    for batch in dataset_train.take(1):
-        inputs, targets = batch
-
-    inputs = keras.layers.Input(shape=(inputs.shape[1], inputs.shape[2]))
-    lstm_out = keras.layers.LSTM(32)(inputs)
-    outputs = keras.layers.Dense(1)(lstm_out)
-
-    model = keras.Model(inputs=inputs, outputs=outputs)
-    model.compile(optimizer=keras.optimizers.Adam(learning_rate=learning_rate), loss="mse")
-    #model.summary()
+    colors = ['#FFBF00', '#194A8D', '#DE3163', '#B676B1']
 
     fig = go.Figure()
-    for x, y in dataset_val.take(5):
-        plot_data = [x[0][:, 1].numpy(), y[0].numpy(), model.predict(x)[0]]
-        labels = ["History", "True Future", "Model Prediction"]
-        time_steps = list(range(-(plot_data[0].shape[0]), 0))
-        delta = 12
-        if delta:
-            future = delta
-        else:
-            future = 0
-
-        for i, val in enumerate(plot_data):
-            if i:
-                fig.add_trace(go.Scatter(x=[future], y=plot_data[i], mode='markers', name=labels[i], marker_symbol=i,
-                                        marker=dict(color='LightSkyBlue', size=10, line=dict(color='MediumPurple', width=2))))
-            else:
-                fig.add_trace(go.Scatter(x=time_steps, y=plot_data[i], mode='lines', name=labels[i],
-                                        line={'width': 2, 'color': 'red'}))
-
-    fig.update_layout(title="Single Step Prediction",
+    fig.add_trace(go.Scatter(x=train.index, y=train['vol_value'], mode='lines', name='Train',
+                            line={'width': 2, 'color': colors[0]}))
+    fig.add_trace(go.Scatter(x=test.index, y=test['vol_value'], mode='lines', name='Test',
+                            line={'width': 2, 'color': colors[1]}))
+    fig.add_trace(go.Scatter(x=y_hat.index, y=y_hat['naive'], mode='lines', name='Naive Forecast',
+                            line={'width': 2, 'color': colors[2]}))
+    fig.add_trace(go.Scatter(x=y_hat_avg.index, y=y_hat_avg['Holt_Winter'], mode='lines', name='Holt_Winter',
+                            line={'width': 2, 'color': colors[3]}))
+    fig.update_layout(title="Voltage Forecast",
                       plot_bgcolor='#deeaee',
                       paper_bgcolor='#deeaee',
                       yaxis_title='Value',
                       xaxis_title="Time-Step")
-      
+    
     return fig
+
 
 @app.callback(
     dash.dependencies.Output('ad-figure', 'figure'),
     [dash.dependencies.Input('period-dropdown', 'value')])
 
 def detect_abn(period):
+    if len(period) < 2:
+        raise PreventUpdate
     df = fetch_all_voltage_as_df(allow_cached=True)
     first_day = int(period[0])
     last_day = int(period[1])
